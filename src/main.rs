@@ -1,15 +1,16 @@
 use anyhow::Result;
 use core::str::FromStr;
-use scale_value::Value;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use subxt::{tx::TxStatus::*, OnlineClient, SubstrateConfig};
 use subxt_signer::{sr25519::Keypair, SecretUri};
 use core::future::Future;
 use std::thread::sleep;
-use std::time::{Instant, SystemTime};
-use subxt::lightclient::LightClient;
+use std::time::SystemTime;
 use std::io::Write;
+use google_cloud_storage::client::Client as GcpClient;
+use google_cloud_storage::client::ClientConfig;
+use google_cloud_storage::http::objects::upload::{Media, UploadObjectRequest, UploadType};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Config {
@@ -18,6 +19,15 @@ struct Config {
     #[serde(skip)]
     secrets: Secrets,
     interval_sec: u32,
+    upload_method: UploadMethod,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+enum UploadMethod {
+    InStatus,
+    GCP {
+        bucket: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -157,16 +167,18 @@ impl TxTiming {
             &config.secrets,
             self.when,
             self.inclusion,
+            config,
         )).await?;
 
         sleep(Duration::from_secs(5));
-        
+
         retry(|| upload_metric(
             &config.page,
             &metrics.finalization,
             &config.secrets,
             self.when,
             self.finalization,
+            config,
         )).await?;
         Ok(())
     }
@@ -178,8 +190,9 @@ async fn upload_metric(
     secret: &Secrets,
     when: i64,
     what: Duration,
+    config: &Config,
 ) -> Result<()> {
-        let body = serde_json::json!({
+    let body = serde_json::json!({
         "timestamp": when,
         "value": what.as_millis(),
     });
@@ -194,24 +207,40 @@ async fn upload_metric(
     writeln!(file, "{}", s)?;
     drop(file);
 
-    let client = reqwest::Client::new();
-    let url = format!("https://api.instatus.com/v1/{page}/metrics/{metric}",);
+    match &config.upload_method {
+        UploadMethod::InStatus => {
+            let client = reqwest::Client::new();
+            let url = format!("https://api.instatus.com/v1/{page}/metrics/{metric}");
 
-    let res = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", &secret.instatus_key))
-        .json(&body)
-        .send()
-        .await?;
+            let res = client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", &secret.instatus_key))
+                .json(&body)
+                .send()
+                .await?;
 
-    if res.status().is_success() {
-        log::info!("Uploaded metric for {}: {:?}", metric, what);
-    } else {
-        log::error!(
-            "Failed to upload metric for {}: {:?}",
-            metric,
-            res.text().await?
-        );
+            if res.status().is_success() {
+                log::info!("Uploaded metric to InStatus for {}: {:?}", metric, what);
+            } else {
+                log::error!(
+                    "Failed to upload metric to InStatus for {}: {:?}",
+                    metric,
+                    res.text().await?
+                );
+            }
+        }
+        UploadMethod::GCP { bucket } => {
+            let config = ClientConfig::default().with_auth().await?;
+            let client = GcpClient::new(config);
+            
+            let upload_type = UploadType::Simple(Media::new(format!("{}/{}_{}.json", page, metric, when)));
+            client.upload_object(&UploadObjectRequest {
+                bucket: bucket.clone(),
+                ..Default::default()
+            }, s.to_owned().into_bytes(), &upload_type).await?;
+            
+            log::info!("Uploaded metric to GCP for {}: {:?}", metric, what);
+        }
     }
 
     Ok(())
@@ -219,8 +248,16 @@ async fn upload_metric(
 
 fn load_config() -> Result<Config> {
     std::env::set_var("RUST_LOG", "info");
-    dotenv::dotenv().ok();
+    if let Err(e) = dotenv::dotenv() {
+        log::error!("Failed to load .env file: {}", e);
+        return Err(anyhow::anyhow!("Failed to load .env file: {}", e));
+    }
     env_logger::init();
+
+    // Debug: Print all environment variables
+    for (key, value) in std::env::vars() {
+        log::debug!("{}={}", key, value);
+    }
 
     if !std::path::Path::new("metrics").exists() {
         std::fs::create_dir("metrics")?;
@@ -229,8 +266,11 @@ fn load_config() -> Result<Config> {
     let config = std::fs::read_to_string("config.json").expect("Failed to read config.json");
     let mut config: Config = serde_json::from_str(&config)?;
 
-    config.secrets.instatus_key = std::env::var("INSTATUS_KEY")?;
     config.secrets.substrate_uri = std::env::var("SUBSTRATE_URI")?;
+
+    if let UploadMethod::InStatus = &config.upload_method {
+        config.secrets.instatus_key = std::env::var("INSTATUS_KEY")?;
+    }
 
     Ok(config)
 }
