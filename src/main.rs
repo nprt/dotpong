@@ -168,6 +168,7 @@ impl TxTiming {
             self.when,
             self.inclusion,
             config,
+            "in_block", // Add event name parameter for inclusion
         )).await?;
 
         sleep(Duration::from_secs(5));
@@ -179,6 +180,7 @@ impl TxTiming {
             self.when,
             self.finalization,
             config,
+            "finalized", // Add event name parameter for finalization
         )).await?;
         Ok(())
     }
@@ -191,9 +193,11 @@ async fn upload_metric(
     when: i64,
     what: Duration,
     config: &Config,
+    event_name: &str, // Add event name parameter
 ) -> Result<()> {
     let body = serde_json::json!({
         "timestamp": when,
+        "event_name": event_name, // Include event name in JSON
         "value": what.as_millis(),
     });
 
